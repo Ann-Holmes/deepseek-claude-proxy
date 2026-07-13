@@ -7,6 +7,9 @@ const LISTEN_PORT = Number(process.env.DS_PROXY_PORT ?? 8787);
 const UPSTREAM_HOST = "api.deepseek.com";
 const UPSTREAM_PREFIX = "/anthropic";
 
+// 关闭 keep-alive，避免复用已被服务端关闭的连接导致 TLS 握手失败。
+const upstreamAgent = new https.Agent({ keepAlive: false });
+
 const HOP_BY_HOP = new Set([
   "connection",
   "keep-alive",
@@ -17,34 +20,6 @@ const HOP_BY_HOP = new Set([
   "transfer-encoding",
   "upgrade",
 ]);
-
-function getSystemText(system) {
-  if (typeof system === "string") {
-    return system;
-  }
-
-  if (!Array.isArray(system)) {
-    return "";
-  }
-
-  return system
-    .map((block) => {
-      if (typeof block === "string") {
-        return block;
-      }
-
-      if (
-        block &&
-        block.type === "text" &&
-        typeof block.text === "string"
-      ) {
-        return block.text;
-      }
-
-      return "";
-    })
-    .join("\n");
-}
 
 function isSecurityClassifier(body) {
   if (!body || typeof body !== "object") {
@@ -168,66 +143,91 @@ const server = http.createServer((req, res) => {
     const upstreamPath =
       `${UPSTREAM_PREFIX}${req.url ?? "/"}`;
 
-    const upstreamReq = https.request(
-      {
-        hostname: UPSTREAM_HOST,
-        port: 443,
-        method: req.method,
-        path: upstreamPath,
-        headers: copyRequestHeaders(
-          req.headers,
-          bodyBuffer.length,
-        ),
-      },
-      (upstreamRes) => {
-        const status =
-          upstreamRes.statusCode ?? 502;
+    let retried = false;
 
-        console.log(
-          `${new Date().toISOString()} ` +
-          `${req.method} ${req.url} ` +
-          `${patched
-            ? "[classifier patched]"
-            : "[pass]"} -> ${status}`,
-        );
-
-        res.writeHead(
-          status,
-          copyResponseHeaders(
-            upstreamRes.headers,
+    function sendUpstream() {
+      const upstreamReq = https.request(
+        {
+          hostname: UPSTREAM_HOST,
+          port: 443,
+          method: req.method,
+          path: upstreamPath,
+          headers: copyRequestHeaders(
+            req.headers,
+            bodyBuffer.length,
           ),
-        );
+          agent: upstreamAgent,
+        },
+        (upstreamRes) => {
+          const status =
+            upstreamRes.statusCode ?? 502;
 
-        upstreamRes.pipe(res);
-      },
-    );
+          console.log(
+            `${new Date().toISOString()} ` +
+            `${req.method} ${req.url} ` +
+            `${patched
+              ? "[classifier patched]"
+              : "[pass]"} -> ${status}`,
+          );
 
-    upstreamReq.on("error", (error) => {
-      console.error(
-        "Upstream error:",
-        error.message,
+          res.writeHead(
+            status,
+            copyResponseHeaders(
+              upstreamRes.headers,
+            ),
+          );
+
+          upstreamRes.pipe(res);
+        },
       );
 
-      if (!res.headersSent) {
-        res.writeHead(502, {
-          "content-type":
-            "application/json; charset=utf-8",
-        });
+      upstreamReq.on("error", (error) => {
+        console.error(
+          "Upstream error:",
+          `[${error.code ?? "no_code"}]`,
+          error.message || "(no message)",
+        );
+
+        // TLS/连接级别的瞬时错误，重试一次。
+        if (
+          !retried &&
+          (error.code === "ECONNRESET" ||
+           error.code === "ETIMEDOUT" ||
+           error.code === "EPIPE" ||
+           !error.message ||
+           /disconnected before secure TLS/.test(
+             error.message ?? "",
+           ))
+        ) {
+          retried = true;
+          console.log(`  ↳ retrying...`);
+          sendUpstream();
+          return;
+        }
+
+        if (!res.headersSent) {
+          res.writeHead(502, {
+            "content-type":
+              "application/json; charset=utf-8",
+          });
+        }
+
+        res.end(
+          JSON.stringify({
+            error: "upstream_error",
+            message: error.message,
+          }),
+        );
+      });
+
+      if (bodyBuffer.length > 0) {
+        upstreamReq.write(bodyBuffer);
       }
 
-      res.end(
-        JSON.stringify({
-          error: "upstream_error",
-          message: error.message,
-        }),
-      );
-    });
-
-    if (bodyBuffer.length > 0) {
-      upstreamReq.write(bodyBuffer);
+      upstreamReq.end();
     }
 
-    upstreamReq.end();
+    sendUpstream();
   });
 
   req.on("error", (error) => {
