@@ -142,11 +142,14 @@ node .\deepseek-auto-proxy.mjs
 
 ### 安全分类请求的识别条件
 
-代理通过以下特征识别安全分类请求（在代理脚本中的 `isSecurityClassifier` 函数中定义）：
+代理通过 `system` 消息内容识别安全分类请求（在代理脚本中的 `isSecurityClassifier` 函数中定义）：
 
-- `stream` 不为 `true`（分类器不使用流式输出）
-- `tools` 为空（分类器不调用工具）
-- `messages` 数量为 1（只包含一条 system 消息）
+- `system` 数组中包含以 `x-anthropic-billing-header:` 开头的文本块
+- `system` 数组中包含以 `You are a security monitor` 开头的文本块
+
+两个条件同时满足即判定为安全分类请求。
+
+> **注意：** 分类请求格式可能随 Claude Code 版本变化。当前基于 **Claude Code 2.1.210** 测试验证。如果升级 Claude Code 后分类请求不再被识别，可能需要更新检测逻辑。
 
 ### 注入内容
 

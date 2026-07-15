@@ -26,23 +26,26 @@ function isSecurityClassifier(body) {
     return false;
   }
 
-  const noTools =
-    !Array.isArray(body.tools) ||
-    body.tools.length === 0;
+  // The classifier carries a system array with:
+  // 1. A billing-header text block
+  // 2. A "security monitor" prompt text block
+  const system = Array.isArray(body.system) ? body.system : [];
 
-  // The classifier carries exactly one system message and no tools.
-  // Normal conversation messages have hundreds of messages + tools.
-  const msgCount = Array.isArray(body.messages)
-    ? body.messages.length
-    : 0;
+  const hasBillingHeader = system.some(
+    (s) =>
+      s?.type === "text" &&
+      typeof s?.text === "string" &&
+      s.text.startsWith("x-anthropic-billing-header:"),
+  );
 
-  // stream may be undefined (absent), false, or true.
-  // Classifier is never streaming.
-  if (body.stream !== true && noTools && msgCount === 1) {
-    return true;
-  }
+  const hasSecurityMonitor = system.some(
+    (s) =>
+      s?.type === "text" &&
+      typeof s?.text === "string" &&
+      s.text.startsWith("You are a security monitor"),
+  );
 
-  return false;
+  return hasBillingHeader && hasSecurityMonitor;
 }
 
 function copyRequestHeaders(headers, bodyLength) {
@@ -120,6 +123,7 @@ const server = http.createServer((req, res) => {
         );
 
         if (isSecurityClassifier(body)) {
+          // body.model = "deepseek-v4-flash";
           body.thinking = {
             type: "disabled",
           };
